@@ -74,9 +74,17 @@ const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 // Preferred model types.
 // Flash-Lite -> Flash -> Pro
 const PREFERRED_PATTERNS = [
+  /^gemini-3\.5-flash-lite$/i,
+  /^gemini-3\.5-flash$/i,
+  /^gemini-3\.6-flash$/i,
+  /^gemini-3\.7-flash$/i,
+  /^gemini-3\.8-flash$/i,
+  /^gemini-3-flash-preview$/i,
+  /^gemini-2\.5-flash$/i,
   /^gemini-.*flash-lite$/i,
   /^gemini-.*flash$/i,
   /^gemini-.*pro$/i,
+];
 ];
 
 // ============================================================
