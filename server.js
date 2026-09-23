@@ -19,7 +19,7 @@ const {
   PHONE_NUMBER_ID,
   APP_SECRET,
   GEMINI_API_KEY,
-  GEMINI_MODEL = "gemini-2.5-flash",
+  GEMINI_MODEL, // optional: force a specific model, skipping auto-detection
   GRAPH_VERSION = "v21.0",
   SYSTEM_PROMPT = "You are a helpful WhatsApp assistant. Keep replies short and friendly, under 600 characters. Plain text only, no markdown.",
 } = process.env;
@@ -34,6 +34,62 @@ for (const k of ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "GEMINI_AP
 const seenMessages = new Set(); // dedupe Meta's webhook retries
 const history = new Map(); // waId -> [{role, parts}]
 const MAX_TURNS = 10;
+
+// ---------------------------------------------------------------- Gemini model auto-detection
+// Google periodically retires model names. Instead of hardcoding one, we ask
+// the API what's actually available and pick the best free/fast chat model,
+// then cache that choice for the life of this process. If GEMINI_MODEL is
+// set in the environment, that overrides auto-detection entirely.
+let resolvedModel = GEMINI_MODEL || null;
+let modelResolvedAt = 0;
+const MODEL_CACHE_MS = 6 * 60 * 60 * 1000; // re-check every 6h in case of new releases
+
+// Preference order: newest/cheapest "flash" style models first. This list is
+// just a tie-breaker for when several models are simultaneously available;
+// the actual availability check always comes from the live API response.
+const PREFERRED_PATTERNS = [
+  /^gemini-.*flash-lite$/,
+  /^gemini-.*flash$/,
+  /^gemini-.*pro$/,
+];
+
+async function resolveGeminiModel() {
+  const fresh = resolvedModel && Date.now() - modelResolvedAt < MODEL_CACHE_MS;
+  if (fresh) return resolvedModel;
+  if (GEMINI_MODEL) return GEMINI_MODEL; // explicit override, never auto-changes
+
+  try {
+    const r = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models",
+      { headers: { "x-goog-api-key": GEMINI_API_KEY } }
+    );
+    const data = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(data));
+
+    const candidates = (data.models || [])
+      .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+      .map((m) => m.name.replace(/^models\//, ""))
+      .filter((name) => /^gemini-/.test(name) && !/vision|embedding|tts|image|live/.test(name));
+
+    let pick = null;
+    for (const pattern of PREFERRED_PATTERNS) {
+      pick = candidates.find((name) => pattern.test(name));
+      if (pick) break;
+    }
+    pick = pick || candidates[0];
+
+    if (!pick) throw new Error("no usable models returned by API");
+
+    console.log(`[gemini] auto-selected model: ${pick}`);
+    resolvedModel = pick;
+    modelResolvedAt = Date.now();
+    return pick;
+  } catch (err) {
+    console.error("[gemini] model auto-detection failed:", err.message);
+    // Fall back to whatever last worked, or a reasonable stable guess.
+    return resolvedModel || "gemini-flash-latest";
+  }
+}
 
 // ---------------------------------------------------------------- health
 app.get("/", (_req, res) => res.status(200).send("ok"));
@@ -118,31 +174,45 @@ function verifySignature(req) {
 }
 
 // ---------------------------------------------------------------- Gemini
+async function callGemini(model, turns) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY,
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: turns,
+      generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
+    }),
+  });
+  const data = await r.json();
+  return { ok: r.ok, status: r.status, data };
+}
+
 async function askGemini(waId, userText) {
   const turns = history.get(waId) || [];
   turns.push({ role: "user", parts: [{ text: userText }] });
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const payloadTurns = turns.slice(-MAX_TURNS * 2);
 
   try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: turns.slice(-MAX_TURNS * 2),
-        generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
-      }),
-    });
+    let model = await resolveGeminiModel();
+    let { ok, status, data } = await callGemini(model, payloadTurns);
 
-    const data = await r.json();
+    // Model we cached just got retired mid-flight — force a fresh lookup once.
+    if (!ok && status === 404 && !GEMINI_MODEL) {
+      console.warn(`[gemini] cached model "${model}" is gone, re-resolving...`);
+      modelResolvedAt = 0;
+      resolvedModel = null;
+      model = await resolveGeminiModel();
+      ({ ok, status, data } = await callGemini(model, payloadTurns));
+    }
 
-    if (!r.ok) {
-      console.error("[gemini] error:", r.status, JSON.stringify(data));
-      if (r.status === 429) return "I'm rate limited right now. Try again in a minute.";
+    if (!ok) {
+      console.error("[gemini] error:", status, JSON.stringify(data));
+      if (status === 429) return "I'm rate limited right now. Try again in a minute.";
       return "Sorry, I couldn't generate a reply. Try again?";
     }
 
