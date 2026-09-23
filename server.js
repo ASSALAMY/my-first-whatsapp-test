@@ -4,7 +4,7 @@ import crypto from "crypto";
 const app = express();
 
 // ============================================================
-// CONFIGURATION
+// EXPRESS / RAW BODY
 // ============================================================
 
 app.use(
@@ -15,6 +15,10 @@ app.use(
   })
 );
 
+// ============================================================
+// ENVIRONMENT VARIABLES
+// ============================================================
+
 const {
   PORT = 3000,
   VERIFY_TOKEN,
@@ -22,16 +26,11 @@ const {
   PHONE_NUMBER_ID,
   APP_SECRET,
   GEMINI_API_KEY,
-
-  // WhatsApp Graph API version
   GRAPH_VERSION = "v21.0",
-
-  // Gemini system prompt
   SYSTEM_PROMPT =
     "You are a helpful WhatsApp assistant. Keep replies short and friendly, under 600 characters. Plain text only, no markdown.",
 } = process.env;
 
-// Check required environment variables
 for (const key of [
   "VERIFY_TOKEN",
   "WHATSAPP_TOKEN",
@@ -44,55 +43,181 @@ for (const key of [
 }
 
 // ============================================================
-// CONVERSATION STATE
+// MEMORY
 // ============================================================
 
-// In-memory storage.
-// Note: Render restarts can clear this.
-// For production, Redis or a database is recommended.
-
 const seenMessages = new Set();
-
 const history = new Map();
 
 const MAX_TURNS = 10;
 
 // ============================================================
-// GEMINI AUTOMATIC MODEL SELECTION
+// GEMINI MODEL AUTOMATIC SELECTION
 // ============================================================
 
-// The server automatically discovers available Gemini models.
-// You do NOT need GEMINI_MODEL in Render.
-
 let resolvedModel = null;
-
 let modelResolvedAt = 0;
 
-// Re-check Google's available models every 6 hours.
 const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 
-// Preferred model types.
-// Flash-Lite -> Flash -> Pro
+// Newer models are preferred.
+// The server will actually TEST the model before selecting it.
 const PREFERRED_PATTERNS = [
-  /^gemini-3\.5-flash-lite$/i,
-  /^gemini-3\.5-flash$/i,
-  /^gemini-3\.6-flash$/i,
-  /^gemini-3\.7-flash$/i,
   /^gemini-3\.8-flash$/i,
+  /^gemini-3\.7-flash$/i,
+  /^gemini-3\.6-flash$/i,
+  /^gemini-3\.5-flash$/i,
+  /^gemini-3\.5-flash-lite$/i,
   /^gemini-3-flash-preview$/i,
   /^gemini-2\.5-flash$/i,
+  /^gemini-flash-lite-latest$/i,
+  /^gemini-flash-latest$/i,
   /^gemini-.*flash-lite$/i,
   /^gemini-.*flash$/i,
   /^gemini-.*pro$/i,
 ];
-];
 
 // ============================================================
-// FIND AVAILABLE GEMINI MODEL
+// GET AVAILABLE GEMINI MODELS
+// ============================================================
+
+async function getAvailableGeminiModels() {
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models",
+    {
+      method: "GET",
+      headers: {
+        "x-goog-api-key": GEMINI_API_KEY,
+      },
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to get Gemini models: ${JSON.stringify(data)}`
+    );
+  }
+
+  const models = (data.models || [])
+    .filter((model) =>
+      model.supportedGenerationMethods?.includes(
+        "generateContent"
+      )
+    )
+    .map((model) =>
+      model.name.replace(/^models\//, "")
+    )
+    .filter(
+      (name) =>
+        /^gemini-/i.test(name) &&
+        !/embedding|vision|tts|image|live|transcribe|robotics|computer-use/i.test(
+          name
+        )
+    );
+
+  return models;
+}
+
+// ============================================================
+// RANK GEMINI MODELS
+// ============================================================
+
+function rankGeminiModels(models) {
+  const ranked = [];
+
+  for (const pattern of PREFERRED_PATTERNS) {
+    for (const model of models) {
+      if (
+        pattern.test(model) &&
+        !ranked.includes(model)
+      ) {
+        ranked.push(model);
+      }
+    }
+  }
+
+  for (const model of models) {
+    if (!ranked.includes(model)) {
+      ranked.push(model);
+    }
+  }
+
+  return ranked;
+}
+
+// ============================================================
+// TEST A GEMINI MODEL
+// ============================================================
+
+async function testGeminiModel(model) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+      },
+
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: "Reply with the word OK.",
+              },
+            ],
+          },
+        ],
+
+        generationConfig: {
+          maxOutputTokens: 5,
+        },
+      }),
+    });
+
+    const data = await response.json();
+
+    if (response.ok) {
+      return {
+        available: true,
+        status: response.status,
+      };
+    }
+
+    console.warn(
+      `[gemini] Model ${model} rejected: ${response.status}`
+    );
+
+    return {
+      available: false,
+      status: response.status,
+      error: data,
+    };
+  } catch (error) {
+    console.warn(
+      `[gemini] Could not test ${model}: ${error.message}`
+    );
+
+    return {
+      available: false,
+      status: 0,
+      error,
+    };
+  }
+}
+
+// ============================================================
+// AUTOMATIC GEMINI MODEL RESOLVER
 // ============================================================
 
 async function resolveGeminiModel() {
-  // Use the cached model if it is still valid.
   if (
     resolvedModel &&
     Date.now() - modelResolvedAt < MODEL_CACHE_MS
@@ -100,99 +225,65 @@ async function resolveGeminiModel() {
     return resolvedModel;
   }
 
+  console.log(
+    "[gemini] Finding a working Gemini model..."
+  );
+
   try {
-    console.log("[gemini] Checking available Gemini models...");
-
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models",
-      {
-        method: "GET",
-        headers: {
-          "x-goog-api-key": GEMINI_API_KEY,
-        },
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        `Gemini model list failed: ${JSON.stringify(data)}`
-      );
-    }
-
-    // Get models that support generateContent.
-    const candidates = (data.models || [])
-      .filter((model) =>
-        model.supportedGenerationMethods?.includes(
-          "generateContent"
-        )
-      )
-      .map((model) =>
-        model.name.replace(/^models\//, "")
-      )
-      .filter(
-        (name) =>
-          /^gemini-/i.test(name) &&
-          !/embedding|vision|tts|image|live/i.test(name)
-      );
-
-    if (!candidates.length) {
-      throw new Error(
-        "Google returned no usable Gemini generateContent models."
-      );
-    }
+    const availableModels =
+      await getAvailableGeminiModels();
 
     console.log(
       "[gemini] Available models:",
-      candidates.join(", ")
+      availableModels.join(", ")
     );
 
-    // Try our preferred model types.
-    let selectedModel = null;
-
-    for (const pattern of PREFERRED_PATTERNS) {
-      selectedModel = candidates.find((name) =>
-        pattern.test(name)
-      );
-
-      if (selectedModel) {
-        break;
-      }
-    }
-
-    // If no preferred model is found,
-    // use the first available compatible model.
-    selectedModel = selectedModel || candidates[0];
-
-    resolvedModel = selectedModel;
-
-    modelResolvedAt = Date.now();
+    const rankedModels =
+      rankGeminiModels(availableModels);
 
     console.log(
-      `[gemini] Automatically selected model: ${selectedModel}`
+      "[gemini] Testing models in this order:",
+      rankedModels.join(", ")
     );
 
-    return selectedModel;
+    for (const model of rankedModels) {
+      console.log(
+        `[gemini] Testing model: ${model}`
+      );
+
+      const result =
+        await testGeminiModel(model);
+
+      if (result.available) {
+        resolvedModel = model;
+        modelResolvedAt = Date.now();
+
+        console.log(
+          `[gemini] Selected working model: ${model}`
+        );
+
+        return model;
+      }
+
+      console.warn(
+        `[gemini] ${model} is unavailable for this API key.`
+      );
+    }
+
+    throw new Error(
+      "No working Gemini model was found."
+    );
   } catch (error) {
     console.error(
-      "[gemini] Automatic model detection failed:",
+      "[gemini] Automatic model selection failed:",
       error.message
     );
 
-    // If a previous model worked, continue using it.
     if (resolvedModel) {
-      console.log(
-        `[gemini] Continuing with previous model: ${resolvedModel}`
-      );
-
       return resolvedModel;
     }
 
-    // No model available.
-    throw new Error(
-      "Unable to automatically select a Gemini model."
-    );
+    throw error;
   }
 }
 
@@ -201,7 +292,9 @@ async function resolveGeminiModel() {
 // ============================================================
 
 app.get("/", (_req, res) => {
-  res.status(200).send("WhatsApp Gemini Bot is running.");
+  res.status(200).send(
+    "WhatsApp Gemini Bot is running."
+  );
 });
 
 // ============================================================
@@ -210,39 +303,41 @@ app.get("/", (_req, res) => {
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
-
   const token = req.query["hub.verify_token"];
-
   const challenge = req.query["hub.challenge"];
 
   if (
     mode === "subscribe" &&
     token === VERIFY_TOKEN
   ) {
-    console.log("[webhook] Verification successful.");
+    console.log(
+      "[webhook] Verification successful."
+    );
 
     return res.status(200).send(challenge);
   }
 
-  console.warn("[webhook] Verification failed.");
+  console.warn(
+    "[webhook] Verification failed."
+  );
 
   return res.sendStatus(403);
 });
 
 // ============================================================
-// WHATSAPP INCOMING MESSAGES
+// WHATSAPP WEBHOOK
 // ============================================================
 
 app.post("/webhook", async (req, res) => {
-  // Verify Meta signature.
   if (!verifySignature(req)) {
-    console.warn("[webhook] Invalid Meta signature.");
+    console.warn(
+      "[webhook] Invalid Meta signature."
+    );
 
     return res.sendStatus(401);
   }
 
-  // Immediately acknowledge Meta.
-  // This helps prevent webhook retries.
+  // Respond to Meta immediately.
   res.sendStatus(200);
 
   try {
@@ -251,19 +346,18 @@ app.post("/webhook", async (req, res) => {
 
     const message = value?.messages?.[0];
 
-    // Ignore delivery/read/status events.
+    // Ignore status updates.
     if (!message) {
       return;
     }
 
-    // Prevent duplicate processing.
+    // Prevent duplicate messages.
     if (seenMessages.has(message.id)) {
       return;
     }
 
     seenMessages.add(message.id);
 
-    // Prevent unlimited memory growth.
     if (seenMessages.size > 1000) {
       seenMessages.clear();
     }
@@ -275,7 +369,7 @@ app.post("/webhook", async (req, res) => {
       "there";
 
     // ========================================================
-    // GET MESSAGE TEXT
+    // READ MESSAGE
     // ========================================================
 
     let text;
@@ -303,11 +397,10 @@ app.post("/webhook", async (req, res) => {
       `[msg] ${profileName} <${from}>: ${text}`
     );
 
-    // Mark WhatsApp message as read.
     await markAsRead(message.id);
 
     // ========================================================
-    // RESET COMMAND
+    // RESET
     // ========================================================
 
     if (
@@ -324,7 +417,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     // ========================================================
-    // ASK GEMINI
+    // GEMINI
     // ========================================================
 
     const reply = await askGemini(
@@ -333,7 +426,7 @@ app.post("/webhook", async (req, res) => {
     );
 
     // ========================================================
-    // SEND REPLY TO WHATSAPP
+    // WHATSAPP RESPONSE
     // ========================================================
 
     await sendText(from, reply);
@@ -350,8 +443,6 @@ app.post("/webhook", async (req, res) => {
 // ============================================================
 
 function verifySignature(req) {
-  // If APP_SECRET is not configured,
-  // skip signature verification.
   if (!APP_SECRET) {
     return true;
   }
@@ -402,9 +493,7 @@ async function callGemini(
 
     headers: {
       "Content-Type": "application/json",
-
-      "x-goog-api-key":
-        GEMINI_API_KEY,
+      "x-goog-api-key": GEMINI_API_KEY,
     },
 
     body: JSON.stringify({
@@ -420,7 +509,6 @@ async function callGemini(
 
       generationConfig: {
         temperature: 0.7,
-
         maxOutputTokens: 500,
       },
     }),
@@ -436,7 +524,7 @@ async function callGemini(
 }
 
 // ============================================================
-// ASK GEMINI WITH CONVERSATION MEMORY
+// ASK GEMINI
 // ============================================================
 
 async function askGemini(
@@ -446,7 +534,6 @@ async function askGemini(
   let turns =
     history.get(waId) || [];
 
-  // Add user message.
   turns.push({
     role: "user",
 
@@ -457,12 +544,10 @@ async function askGemini(
     ],
   });
 
-  // Keep the conversation short.
   const payloadTurns =
     turns.slice(-MAX_TURNS * 2);
 
   try {
-    // Automatically select Gemini model.
     let model =
       await resolveGeminiModel();
 
@@ -470,7 +555,6 @@ async function askGemini(
       `[gemini] Using model: ${model}`
     );
 
-    // Call Gemini.
     let result =
       await callGemini(
         model,
@@ -478,7 +562,7 @@ async function askGemini(
       );
 
     // ========================================================
-    // IF MODEL DISAPPEARS, FIND ANOTHER MODEL
+    // IF MODEL STOPS WORKING, FIND ANOTHER
     // ========================================================
 
     if (
@@ -487,15 +571,12 @@ async function askGemini(
         result.status === 400)
     ) {
       console.warn(
-        `[gemini] Model "${model}" failed. Searching for another available model...`
+        `[gemini] Model ${model} failed. Finding another model...`
       );
 
-      // Clear cached model.
       resolvedModel = null;
-
       modelResolvedAt = 0;
 
-      // Find another model.
       model =
         await resolveGeminiModel();
 
@@ -511,7 +592,7 @@ async function askGemini(
     }
 
     // ========================================================
-    // HANDLE GEMINI ERROR
+    // HANDLE ERRORS
     // ========================================================
 
     if (!result.ok) {
@@ -537,7 +618,7 @@ async function askGemini(
     }
 
     // ========================================================
-    // EXTRACT GEMINI RESPONSE
+    // GET GEMINI TEXT
     // ========================================================
 
     const reply =
@@ -558,7 +639,6 @@ async function askGemini(
       ],
     });
 
-    // Keep only recent conversation.
     history.set(
       waId,
       turns.slice(-MAX_TURNS * 2)
@@ -576,15 +656,13 @@ async function askGemini(
 }
 
 // ============================================================
-// SEND WHATSAPP TEXT MESSAGE
+// SEND WHATSAPP MESSAGE
 // ============================================================
 
 async function sendText(
   to,
   body
 ) {
-  // WhatsApp text limit is 4096 characters.
-  // We use 4000 to stay safely below it.
   const chunks =
     body.match(/[\s\S]{1,4000}/g) ||
     [body];
@@ -618,7 +696,6 @@ async function sendText(
 
               text: {
                 preview_url: false,
-
                 body: chunk,
               },
             }),
@@ -642,7 +719,7 @@ async function sendText(
 }
 
 // ============================================================
-// MARK WHATSAPP MESSAGE AS READ
+// MARK MESSAGE AS READ
 // ============================================================
 
 async function markAsRead(
@@ -673,7 +750,6 @@ async function markAsRead(
       }
     );
   } catch (error) {
-    // Marking as read is not critical.
     console.warn(
       "[whatsapp] Could not mark message as read:",
       error.message
@@ -685,15 +761,12 @@ async function markAsRead(
 // START SERVER
 // ============================================================
 
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `WhatsApp Gemini bot listening on port ${PORT}`
-    );
+app.listen(PORT, () => {
+  console.log(
+    `WhatsApp Gemini Bot listening on port ${PORT}`
+  );
 
-    console.log(
-      "[gemini] Automatic model selection is ENABLED."
-    );
-  }
-);
+  console.log(
+    "[gemini] Automatic model selection is ENABLED."
+  );
+});
