@@ -3,7 +3,10 @@ import crypto from "crypto";
 
 const app = express();
 
-// Keep the raw body so we can verify Meta's signature.
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -19,117 +22,256 @@ const {
   PHONE_NUMBER_ID,
   APP_SECRET,
   GEMINI_API_KEY,
-  GEMINI_MODEL, // optional: force a specific model, skipping auto-detection
+
+  // WhatsApp Graph API version
   GRAPH_VERSION = "v21.0",
-  SYSTEM_PROMPT = "You are a helpful WhatsApp assistant. Keep replies short and friendly, under 600 characters. Plain text only, no markdown.",
+
+  // Gemini system prompt
+  SYSTEM_PROMPT =
+    "You are a helpful WhatsApp assistant. Keep replies short and friendly, under 600 characters. Plain text only, no markdown.",
 } = process.env;
 
-for (const k of ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "GEMINI_API_KEY"]) {
-  if (!process.env[k]) console.warn(`[warn] missing env var: ${k}`);
+// Check required environment variables
+for (const key of [
+  "VERIFY_TOKEN",
+  "WHATSAPP_TOKEN",
+  "PHONE_NUMBER_ID",
+  "GEMINI_API_KEY",
+]) {
+  if (!process.env[key]) {
+    console.warn(`[warn] Missing environment variable: ${key}`);
+  }
 }
 
-// ---------------------------------------------------------------- state
-// In-memory only. Render restarts / sleeps will wipe this.
-// Swap for Redis or a DB when you go past testing.
-const seenMessages = new Set(); // dedupe Meta's webhook retries
-const history = new Map(); // waId -> [{role, parts}]
+// ============================================================
+// CONVERSATION STATE
+// ============================================================
+
+// In-memory storage.
+// Note: Render restarts can clear this.
+// For production, Redis or a database is recommended.
+
+const seenMessages = new Set();
+
+const history = new Map();
+
 const MAX_TURNS = 10;
 
-// ---------------------------------------------------------------- Gemini model auto-detection
-// Google periodically retires model names. Instead of hardcoding one, we ask
-// the API what's actually available and pick the best free/fast chat model,
-// then cache that choice for the life of this process. If GEMINI_MODEL is
-// set in the environment, that overrides auto-detection entirely.
-let resolvedModel = GEMINI_MODEL || null;
-let modelResolvedAt = 0;
-const MODEL_CACHE_MS = 6 * 60 * 60 * 1000; // re-check every 6h in case of new releases
+// ============================================================
+// GEMINI AUTOMATIC MODEL SELECTION
+// ============================================================
 
-// Preference order: newest/cheapest "flash" style models first. This list is
-// just a tie-breaker for when several models are simultaneously available;
-// the actual availability check always comes from the live API response.
+// The server automatically discovers available Gemini models.
+// You do NOT need GEMINI_MODEL in Render.
+
+let resolvedModel = null;
+
+let modelResolvedAt = 0;
+
+// Re-check Google's available models every 6 hours.
+const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
+
+// Preferred model types.
+// Flash-Lite -> Flash -> Pro
 const PREFERRED_PATTERNS = [
-  /^gemini-.*flash-lite$/,
-  /^gemini-.*flash$/,
-  /^gemini-.*pro$/,
+  /^gemini-.*flash-lite$/i,
+  /^gemini-.*flash$/i,
+  /^gemini-.*pro$/i,
 ];
 
+// ============================================================
+// FIND AVAILABLE GEMINI MODEL
+// ============================================================
+
 async function resolveGeminiModel() {
-  const fresh = resolvedModel && Date.now() - modelResolvedAt < MODEL_CACHE_MS;
-  if (fresh) return resolvedModel;
-  if (GEMINI_MODEL) return GEMINI_MODEL; // explicit override, never auto-changes
+  // Use the cached model if it is still valid.
+  if (
+    resolvedModel &&
+    Date.now() - modelResolvedAt < MODEL_CACHE_MS
+  ) {
+    return resolvedModel;
+  }
 
   try {
-    const r = await fetch(
+    console.log("[gemini] Checking available Gemini models...");
+
+    const response = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/models",
-      { headers: { "x-goog-api-key": GEMINI_API_KEY } }
+      {
+        method: "GET",
+        headers: {
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+      }
     );
-    const data = await r.json();
-    if (!r.ok) throw new Error(JSON.stringify(data));
 
-    const candidates = (data.models || [])
-      .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
-      .map((m) => m.name.replace(/^models\//, ""))
-      .filter((name) => /^gemini-/.test(name) && !/vision|embedding|tts|image|live/.test(name));
+    const data = await response.json();
 
-    let pick = null;
-    for (const pattern of PREFERRED_PATTERNS) {
-      pick = candidates.find((name) => pattern.test(name));
-      if (pick) break;
+    if (!response.ok) {
+      throw new Error(
+        `Gemini model list failed: ${JSON.stringify(data)}`
+      );
     }
-    pick = pick || candidates[0];
 
-    if (!pick) throw new Error("no usable models returned by API");
+    // Get models that support generateContent.
+    const candidates = (data.models || [])
+      .filter((model) =>
+        model.supportedGenerationMethods?.includes(
+          "generateContent"
+        )
+      )
+      .map((model) =>
+        model.name.replace(/^models\//, "")
+      )
+      .filter(
+        (name) =>
+          /^gemini-/i.test(name) &&
+          !/embedding|vision|tts|image|live/i.test(name)
+      );
 
-    console.log(`[gemini] auto-selected model: ${pick}`);
-    resolvedModel = pick;
+    if (!candidates.length) {
+      throw new Error(
+        "Google returned no usable Gemini generateContent models."
+      );
+    }
+
+    console.log(
+      "[gemini] Available models:",
+      candidates.join(", ")
+    );
+
+    // Try our preferred model types.
+    let selectedModel = null;
+
+    for (const pattern of PREFERRED_PATTERNS) {
+      selectedModel = candidates.find((name) =>
+        pattern.test(name)
+      );
+
+      if (selectedModel) {
+        break;
+      }
+    }
+
+    // If no preferred model is found,
+    // use the first available compatible model.
+    selectedModel = selectedModel || candidates[0];
+
+    resolvedModel = selectedModel;
+
     modelResolvedAt = Date.now();
-    return pick;
-  } catch (err) {
-    console.error("[gemini] model auto-detection failed:", err.message);
-    // Fall back to whatever last worked, or a reasonable stable guess.
-    return resolvedModel || "gemini-flash-latest";
+
+    console.log(
+      `[gemini] Automatically selected model: ${selectedModel}`
+    );
+
+    return selectedModel;
+  } catch (error) {
+    console.error(
+      "[gemini] Automatic model detection failed:",
+      error.message
+    );
+
+    // If a previous model worked, continue using it.
+    if (resolvedModel) {
+      console.log(
+        `[gemini] Continuing with previous model: ${resolvedModel}`
+      );
+
+      return resolvedModel;
+    }
+
+    // No model available.
+    throw new Error(
+      "Unable to automatically select a Gemini model."
+    );
   }
 }
 
-// ---------------------------------------------------------------- health
-app.get("/", (_req, res) => res.status(200).send("ok"));
+// ============================================================
+// HEALTH CHECK
+// ============================================================
 
-// ---------------------------------------------------------------- webhook verification (GET)
+app.get("/", (_req, res) => {
+  res.status(200).send("WhatsApp Gemini Bot is running.");
+});
+
+// ============================================================
+// WHATSAPP WEBHOOK VERIFICATION
+// ============================================================
+
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
+
   const token = req.query["hub.verify_token"];
+
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("[webhook] verified");
+  if (
+    mode === "subscribe" &&
+    token === VERIFY_TOKEN
+  ) {
+    console.log("[webhook] Verification successful.");
+
     return res.status(200).send(challenge);
   }
+
+  console.warn("[webhook] Verification failed.");
+
   return res.sendStatus(403);
 });
 
-// ---------------------------------------------------------------- incoming messages (POST)
+// ============================================================
+// WHATSAPP INCOMING MESSAGES
+// ============================================================
+
 app.post("/webhook", async (req, res) => {
+  // Verify Meta signature.
   if (!verifySignature(req)) {
-    console.warn("[webhook] bad signature");
+    console.warn("[webhook] Invalid Meta signature.");
+
     return res.sendStatus(401);
   }
 
-  // Ack immediately — Meta gives you ~20s before it retries.
+  // Immediately acknowledge Meta.
+  // This helps prevent webhook retries.
   res.sendStatus(200);
 
   try {
-    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const value =
+      req.body?.entry?.[0]?.changes?.[0]?.value;
+
     const message = value?.messages?.[0];
-    if (!message) return; // status update (delivered/read), not a message
 
-    if (seenMessages.has(message.id)) return;
+    // Ignore delivery/read/status events.
+    if (!message) {
+      return;
+    }
+
+    // Prevent duplicate processing.
+    if (seenMessages.has(message.id)) {
+      return;
+    }
+
     seenMessages.add(message.id);
-    if (seenMessages.size > 1000) seenMessages.clear();
 
-    const from = message.from; // user's number in international format
-    const profileName = value?.contacts?.[0]?.profile?.name || "there";
+    // Prevent unlimited memory growth.
+    if (seenMessages.size > 1000) {
+      seenMessages.clear();
+    }
+
+    const from = message.from;
+
+    const profileName =
+      value?.contacts?.[0]?.profile?.name ||
+      "there";
+
+    // ========================================================
+    // GET MESSAGE TEXT
+    // ========================================================
 
     let text;
+
     if (message.type === "text") {
       text = message.text.body;
     } else if (message.type === "interactive") {
@@ -137,151 +279,413 @@ app.post("/webhook", async (req, res) => {
         message.interactive?.button_reply?.title ||
         message.interactive?.list_reply?.title;
     } else {
-      await sendText(from, `I can only read text messages right now (you sent: ${message.type}).`);
+      await sendText(
+        from,
+        `I can only read text messages right now. You sent: ${message.type}`
+      );
+
       return;
     }
 
-    console.log(`[msg] ${profileName} <${from}>: ${text}`);
+    if (!text || !text.trim()) {
+      return;
+    }
 
+    console.log(
+      `[msg] ${profileName} <${from}>: ${text}`
+    );
+
+    // Mark WhatsApp message as read.
     await markAsRead(message.id);
 
-    if (text.trim().toLowerCase() === "/reset") {
+    // ========================================================
+    // RESET COMMAND
+    // ========================================================
+
+    if (
+      text.trim().toLowerCase() === "/reset"
+    ) {
       history.delete(from);
-      await sendText(from, "Conversation reset. ✅");
+
+      await sendText(
+        from,
+        "Conversation reset. ✅"
+      );
+
       return;
     }
 
-    const reply = await askGemini(from, text);
+    // ========================================================
+    // ASK GEMINI
+    // ========================================================
+
+    const reply = await askGemini(
+      from,
+      text
+    );
+
+    // ========================================================
+    // SEND REPLY TO WHATSAPP
+    // ========================================================
+
     await sendText(from, reply);
-  } catch (err) {
-    console.error("[webhook] handler error:", err);
+  } catch (error) {
+    console.error(
+      "[webhook] Handler error:",
+      error
+    );
   }
 });
 
-// ---------------------------------------------------------------- Meta signature check
+// ============================================================
+// META SIGNATURE VERIFICATION
+// ============================================================
+
 function verifySignature(req) {
-  if (!APP_SECRET) return true; // skip if you haven't set it yet
-  const header = req.get("x-hub-signature-256");
-  if (!header || !req.rawBody) return false;
+  // If APP_SECRET is not configured,
+  // skip signature verification.
+  if (!APP_SECRET) {
+    return true;
+  }
+
+  const signature =
+    req.get("x-hub-signature-256");
+
+  if (!signature || !req.rawBody) {
+    return false;
+  }
 
   const expected =
     "sha256=" +
-    crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
+    crypto
+      .createHmac("sha256", APP_SECRET)
+      .update(req.rawBody)
+      .digest("hex");
 
-  const a = Buffer.from(header);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const receivedBuffer =
+    Buffer.from(signature);
+
+  const expectedBuffer =
+    Buffer.from(expected);
+
+  return (
+    receivedBuffer.length ===
+      expectedBuffer.length &&
+    crypto.timingSafeEqual(
+      receivedBuffer,
+      expectedBuffer
+    )
+  );
 }
 
-// ---------------------------------------------------------------- Gemini
-async function callGemini(model, turns) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-  const r = await fetch(url, {
+// ============================================================
+// CALL GEMINI
+// ============================================================
+
+async function callGemini(
+  model,
+  turns
+) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const response = await fetch(url, {
     method: "POST",
+
     headers: {
       "Content-Type": "application/json",
-      "x-goog-api-key": GEMINI_API_KEY,
+
+      "x-goog-api-key":
+        GEMINI_API_KEY,
     },
+
     body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      systemInstruction: {
+        parts: [
+          {
+            text: SYSTEM_PROMPT,
+          },
+        ],
+      },
+
       contents: turns,
-      generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
+
+      generationConfig: {
+        temperature: 0.7,
+
+        maxOutputTokens: 500,
+      },
     }),
   });
-  const data = await r.json();
-  return { ok: r.ok, status: r.status, data };
+
+  const data = await response.json();
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+  };
 }
 
-async function askGemini(waId, userText) {
-  const turns = history.get(waId) || [];
-  turns.push({ role: "user", parts: [{ text: userText }] });
-  const payloadTurns = turns.slice(-MAX_TURNS * 2);
+// ============================================================
+// ASK GEMINI WITH CONVERSATION MEMORY
+// ============================================================
+
+async function askGemini(
+  waId,
+  userText
+) {
+  let turns =
+    history.get(waId) || [];
+
+  // Add user message.
+  turns.push({
+    role: "user",
+
+    parts: [
+      {
+        text: userText,
+      },
+    ],
+  });
+
+  // Keep the conversation short.
+  const payloadTurns =
+    turns.slice(-MAX_TURNS * 2);
 
   try {
-    let model = await resolveGeminiModel();
-    let { ok, status, data } = await callGemini(model, payloadTurns);
+    // Automatically select Gemini model.
+    let model =
+      await resolveGeminiModel();
 
-    // Model we cached just got retired mid-flight — force a fresh lookup once.
-    if (!ok && status === 404 && !GEMINI_MODEL) {
-      console.warn(`[gemini] cached model "${model}" is gone, re-resolving...`);
-      modelResolvedAt = 0;
-      resolvedModel = null;
-      model = await resolveGeminiModel();
-      ({ ok, status, data } = await callGemini(model, payloadTurns));
-    }
-
-    if (!ok) {
-      console.error("[gemini] error:", status, JSON.stringify(data));
-      if (status === 429) return "I'm rate limited right now. Try again in a minute.";
-      return "Sorry, I couldn't generate a reply. Try again?";
-    }
-
-    const reply =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text)
-        .filter(Boolean)
-        .join("") || "Hmm, I didn't get that. Can you rephrase?";
-
-    turns.push({ role: "model", parts: [{ text: reply }] });
-    history.set(waId, turns.slice(-MAX_TURNS * 2));
-
-    return reply;
-  } catch (err) {
-    console.error("[gemini] fetch failed:", err);
-    return "Something went wrong on my side. Try again shortly.";
-  }
-}
-
-// ---------------------------------------------------------------- WhatsApp send
-async function sendText(to, body) {
-  // WhatsApp hard-caps text bodies at 4096 chars.
-  const chunks = body.match(/[\s\S]{1,4000}/g) || [body];
-
-  for (const chunk of chunks) {
-    const r = await fetch(
-      `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          recipient_type: "individual",
-          to,
-          type: "text",
-          text: { preview_url: false, body: chunk },
-        }),
-      }
+    console.log(
+      `[gemini] Using model: ${model}`
     );
 
-    if (!r.ok) {
-      console.error("[whatsapp] send failed:", r.status, await r.text());
+    // Call Gemini.
+    let result =
+      await callGemini(
+        model,
+        payloadTurns
+      );
+
+    // ========================================================
+    // IF MODEL DISAPPEARS, FIND ANOTHER MODEL
+    // ========================================================
+
+    if (
+      !result.ok &&
+      (result.status === 404 ||
+        result.status === 400)
+    ) {
+      console.warn(
+        `[gemini] Model "${model}" failed. Searching for another available model...`
+      );
+
+      // Clear cached model.
+      resolvedModel = null;
+
+      modelResolvedAt = 0;
+
+      // Find another model.
+      model =
+        await resolveGeminiModel();
+
+      console.log(
+        `[gemini] Retrying with model: ${model}`
+      );
+
+      result =
+        await callGemini(
+          model,
+          payloadTurns
+        );
+    }
+
+    // ========================================================
+    // HANDLE GEMINI ERROR
+    // ========================================================
+
+    if (!result.ok) {
+      console.error(
+        "[gemini] API error:",
+        result.status,
+        JSON.stringify(result.data)
+      );
+
+      if (result.status === 429) {
+        return "I'm rate limited right now. Please try again in a minute.";
+      }
+
+      if (result.status === 401) {
+        return "The Gemini API key is invalid or has expired.";
+      }
+
+      if (result.status === 403) {
+        return "The Gemini API key does not have permission to use this service.";
+      }
+
+      return "Sorry, I couldn't generate a reply right now. Please try again.";
+    }
+
+    // ========================================================
+    // EXTRACT GEMINI RESPONSE
+    // ========================================================
+
+    const reply =
+      result.data?.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text)
+        .filter(Boolean)
+        .join("") ||
+      "Hmm, I didn't get that. Can you rephrase?";
+
+    // Save assistant response.
+    turns.push({
+      role: "model",
+
+      parts: [
+        {
+          text: reply,
+        },
+      ],
+    });
+
+    // Keep only recent conversation.
+    history.set(
+      waId,
+      turns.slice(-MAX_TURNS * 2)
+    );
+
+    return reply;
+  } catch (error) {
+    console.error(
+      "[gemini] Request failed:",
+      error
+    );
+
+    return "Something went wrong on my side. Please try again shortly.";
+  }
+}
+
+// ============================================================
+// SEND WHATSAPP TEXT MESSAGE
+// ============================================================
+
+async function sendText(
+  to,
+  body
+) {
+  // WhatsApp text limit is 4096 characters.
+  // We use 4000 to stay safely below it.
+  const chunks =
+    body.match(/[\s\S]{1,4000}/g) ||
+    [body];
+
+  for (const chunk of chunks) {
+    try {
+      const response =
+        await fetch(
+          `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
+          {
+            method: "POST",
+
+            headers: {
+              Authorization:
+                `Bearer ${WHATSAPP_TOKEN}`,
+
+              "Content-Type":
+                "application/json",
+            },
+
+            body: JSON.stringify({
+              messaging_product:
+                "whatsapp",
+
+              recipient_type:
+                "individual",
+
+              to,
+
+              type: "text",
+
+              text: {
+                preview_url: false,
+
+                body: chunk,
+              },
+            }),
+          }
+        );
+
+      if (!response.ok) {
+        console.error(
+          "[whatsapp] Send failed:",
+          response.status,
+          await response.text()
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[whatsapp] Send request failed:",
+        error
+      );
     }
   }
 }
 
-async function markAsRead(messageId) {
+// ============================================================
+// MARK WHATSAPP MESSAGE AS READ
+// ============================================================
+
+async function markAsRead(
+  messageId
+) {
   try {
     await fetch(
       `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
       {
         method: "POST",
+
         headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json",
+          Authorization:
+            `Bearer ${WHATSAPP_TOKEN}`,
+
+          "Content-Type":
+            "application/json",
         },
+
         body: JSON.stringify({
-          messaging_product: "whatsapp",
+          messaging_product:
+            "whatsapp",
+
           status: "read",
+
           message_id: messageId,
         }),
       }
     );
-  } catch {
-    /* non-critical */
+  } catch (error) {
+    // Marking as read is not critical.
+    console.warn(
+      "[whatsapp] Could not mark message as read:",
+      error.message
+    );
   }
 }
 
-app.listen(PORT, () => console.log(`listening on :${PORT}`));
+// ============================================================
+// START SERVER
+// ============================================================
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `WhatsApp Gemini bot listening on port ${PORT}`
+    );
+
+    console.log(
+      "[gemini] Automatic model selection is ENABLED."
+    );
+  }
+);
