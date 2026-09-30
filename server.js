@@ -60,6 +60,7 @@ async function getModelCandidates() {
   try {
     const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
       headers: { "x-goog-api-key": GEMINI_API_KEY },
+      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
     });
     const data = await r.json();
     if (!r.ok) throw new Error(JSON.stringify(data));
@@ -169,6 +170,12 @@ function verifySignature(req) {
 }
 
 // ---------------------------------------------------------------- Gemini call
+// Node's default fetch will hang up to 5 minutes on a stalled connection
+// before giving up. That's far too long for a chat reply, so every outbound
+// call here gets an explicit, much shorter timeout via AbortSignal.
+const GEMINI_TIMEOUT_MS = 15_000;
+const WHATSAPP_TIMEOUT_MS = 10_000;
+
 async function callGemini(model, turns) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const r = await fetch(url, {
@@ -182,6 +189,7 @@ async function callGemini(model, turns) {
       contents: turns,
       generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
     }),
+    signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
   const data = await r.json().catch(() => ({}));
   return { ok: r.ok, status: r.status, data };
@@ -201,7 +209,15 @@ async function askGemini(waId, userText) {
     outer: for (model of candidates) {
       // Up to 2 tries per model, in case of a one-off blip.
       for (let attempt = 1; attempt <= 2; attempt++) {
-        ({ ok, status, data } = await callGemini(model, payloadTurns));
+        try {
+          ({ ok, status, data } = await callGemini(model, payloadTurns));
+        } catch (err) {
+          // AbortSignal.timeout() throws rather than returning a status —
+          // treat a stalled/hung connection the same as a 503 (retryable).
+          ok = false;
+          status = err.name === "TimeoutError" || err.name === "AbortError" ? 408 : 0;
+          data = { error: err.message };
+        }
         if (ok) break outer;
 
         console.error(`[gemini] ${model} failed: ${status}`);
@@ -210,7 +226,7 @@ async function askGemini(waId, userText) {
           deadModels.add(model); // never try this one again this run
           break; // move to next candidate immediately
         }
-        if ([429, 500, 503].includes(status) && attempt === 1) {
+        if ([408, 429, 500, 503].includes(status) && attempt === 1) {
           await sleep(800); // brief pause, then one more try on the same model
           continue;
         }
@@ -221,7 +237,7 @@ async function askGemini(waId, userText) {
     if (!ok) {
       console.error("[gemini] all attempts failed:", status, JSON.stringify(data));
       if (status === 429) return "I'm rate limited right now. Try again in a minute.";
-      if (status === 503) return "The AI is very busy right now. Please try again in a moment.";
+      if (status === 503 || status === 408) return "The AI is very busy right now. Please try again in a moment.";
       return "Sorry, I couldn't generate a reply. Try again?";
     }
 
@@ -247,26 +263,31 @@ async function sendText(to, body) {
   const chunks = body.match(/[\s\S]{1,4000}/g) || [body];
 
   for (const chunk of chunks) {
-    const r = await fetch(
-      `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          recipient_type: "individual",
-          to,
-          type: "text",
-          text: { preview_url: false, body: chunk },
-        }),
-      }
-    );
+    try {
+      const r = await fetch(
+        `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            messaging_product: "whatsapp",
+            recipient_type: "individual",
+            to,
+            type: "text",
+            text: { preview_url: false, body: chunk },
+          }),
+          signal: AbortSignal.timeout(WHATSAPP_TIMEOUT_MS),
+        }
+      );
 
-    if (!r.ok) {
-      console.error("[whatsapp] send failed:", r.status, await r.text());
+      if (!r.ok) {
+        console.error("[whatsapp] send failed:", r.status, await r.text());
+      }
+    } catch (err) {
+      console.error("[whatsapp] send request failed:", err.message);
     }
   }
 }
@@ -286,6 +307,7 @@ async function markAsRead(messageId) {
           status: "read",
           message_id: messageId,
         }),
+        signal: AbortSignal.timeout(WHATSAPP_TIMEOUT_MS),
       }
     );
   } catch {
