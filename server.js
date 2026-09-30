@@ -35,23 +35,27 @@ const history = new Map(); // waId -> [{role, parts}]
 const MAX_TURNS = 10;
 
 // ---------------------------------------------------------------- Gemini model auto-detection
-// Google retires model names regularly. We ask the API what's live, pick the
-// best fast model, cache it, and keep a few ranked fallbacks for when the
-// main one is overloaded (503). GEMINI_MODEL env var overrides all of this.
-let resolvedModel = GEMINI_MODEL || null;
-let fallbackModels = [];
-let modelResolvedAt = 0;
+// Google's own model-list endpoint isn't fully trustworthy: it can list a
+// model as "supports generateContent" even after that model has actually
+// been retired for this account (you only find out when the real call
+// 404s). So instead of trusting the list to pick ONE model, we rank every
+// candidate the list returns and try them in order at call time, skipping
+// forward past 404s. GEMINI_MODEL env var overrides all of this.
+let modelListCache = null; // ordered array of candidate model names
+let modelListAt = 0;
 const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
+const deadModels = new Set(); // 404'd this run — never retry them again
 
-const PREFERRED_PATTERNS = [
-  /^gemini-.*flash-lite$/,
-  /^gemini-.*flash$/,
-  /^gemini-.*pro$/,
-];
+function versionOf(name) {
+  const m = name.match(/gemini-(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
 
-async function resolveGeminiModel() {
-  if (GEMINI_MODEL) return GEMINI_MODEL;
-  if (resolvedModel && Date.now() - modelResolvedAt < MODEL_CACHE_MS) return resolvedModel;
+async function getModelCandidates() {
+  if (GEMINI_MODEL) return [GEMINI_MODEL];
+  if (modelListCache && Date.now() - modelListAt < MODEL_CACHE_MS) {
+    return modelListCache.filter((n) => !deadModels.has(n));
+  }
 
   try {
     const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
@@ -65,23 +69,20 @@ async function resolveGeminiModel() {
       .map((m) => m.name.replace(/^models\//, ""))
       .filter((n) => /^gemini-/.test(n) && !/vision|embedding|tts|image|live/.test(n));
 
-    // Rank by preference order, keep the rest as a last resort.
-    const ranked = [];
-    for (const pattern of PREFERRED_PATTERNS) {
-      for (const n of candidates) if (pattern.test(n) && !ranked.includes(n)) ranked.push(n);
-    }
-    for (const n of candidates) if (!ranked.includes(n)) ranked.push(n);
+    // Prefer newer major versions first, then flash-lite > flash > pro
+    // within the same version (cheapest/fastest first).
+    const tierOf = (n) => (/flash-lite/.test(n) ? 0 : /flash/.test(n) ? 1 : /pro/.test(n) ? 2 : 3);
+    candidates.sort((a, b) => versionOf(b) - versionOf(a) || tierOf(a) - tierOf(b));
 
-    if (!ranked.length) throw new Error("no usable models returned by API");
+    if (!candidates.length) throw new Error("no usable models returned by API");
 
-    resolvedModel = ranked[0];
-    fallbackModels = ranked.slice(1, 4);
-    modelResolvedAt = Date.now();
-    console.log(`[gemini] auto-selected model: ${resolvedModel} (fallbacks: ${fallbackModels.join(", ") || "none"})`);
-    return resolvedModel;
+    modelListCache = candidates;
+    modelListAt = Date.now();
+    console.log(`[gemini] model candidates: ${candidates.join(", ")}`);
+    return candidates.filter((n) => !deadModels.has(n));
   } catch (err) {
-    console.error("[gemini] model auto-detection failed:", err.message);
-    return resolvedModel || "gemini-flash-latest";
+    console.error("[gemini] model list fetch failed:", err.message);
+    return (modelListCache || ["gemini-flash-latest"]).filter((n) => !deadModels.has(n));
   }
 }
 
@@ -194,32 +195,27 @@ async function askGemini(waId, userText) {
   const payloadTurns = turns.slice(-MAX_TURNS * 2);
 
   try {
-    const primary = await resolveGeminiModel();
-    // Try the main model twice (transient blips), then each fallback once.
-    const attempts = [primary, primary, ...(GEMINI_MODEL ? [] : fallbackModels)];
-    let ok = false, status = 0, data = null, reResolved = false;
+    const candidates = await getModelCandidates();
+    let ok = false, status = 0, data = null, model = null;
 
-    for (let i = 0; i < attempts.length; i++) {
-      const model = attempts[i];
-      ({ ok, status, data } = await callGemini(model, payloadTurns));
-      if (ok) break;
+    outer: for (model of candidates) {
+      // Up to 2 tries per model, in case of a one-off blip.
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        ({ ok, status, data } = await callGemini(model, payloadTurns));
+        if (ok) break outer;
 
-      console.error(`[gemini] ${model} failed: ${status}`);
+        console.error(`[gemini] ${model} failed: ${status}`);
 
-      // Model retired: re-detect once and try the fresh pick next.
-      if (status === 404 && !GEMINI_MODEL && !reResolved) {
-        reResolved = true;
-        modelResolvedAt = 0;
-        resolvedModel = null;
-        attempts.splice(i + 1, 0, await resolveGeminiModel());
-        continue;
+        if (status === 404 && !GEMINI_MODEL) {
+          deadModels.add(model); // never try this one again this run
+          break; // move to next candidate immediately
+        }
+        if ([429, 500, 503].includes(status) && attempt === 1) {
+          await sleep(800); // brief pause, then one more try on the same model
+          continue;
+        }
+        break; // exhausted retries on this model, or a non-retryable error
       }
-      // Overloaded / rate limited / server hiccup: pause, then move on.
-      if ([429, 500, 503].includes(status)) {
-        await sleep(1000 * (i + 1));
-        continue;
-      }
-      break; // 400/403 etc. won't be fixed by retrying
     }
 
     if (!ok) {
